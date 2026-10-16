@@ -3,7 +3,7 @@
 BOOL pm_shared_initialized = FALSE;
 
 vec3_t rgv3tStuckTable[54];
-int rgStuckLast[MAX_CLIENTS][2];
+int rgStuckLast[MAX_EDICTS][2]; // per entity, see PM_StuckIndex
 
 int pm_gcTextures = 0;
 char pm_grgszTextureName[MAX_TEXTURES][MAX_TEXTURENAME_LENGHT];
@@ -11,6 +11,49 @@ char pm_grgchTextureType[MAX_TEXTURES];
 
 playermove_t *pmove = nullptr;
 BOOL g_onladder = FALSE;
+
+// The engine can run the player movement for non-player entities too (ReHLDS SV_RunEntityMove),
+// pmove->player_index is the entity index - 1 then
+inline bool PM_IsPlayerIndex(int index)
+{
+	return index >= 0 && index < gpGlobals->maxClients;
+}
+
+// Stuck checks are tracked per moved entity
+inline int PM_StuckIndex(int index)
+{
+	return (index >= 0 && index < MAX_EDICTS) ? index : 0;
+}
+
+// Lets the code that moves entities (e.g. the PM Entity module) check that PM_Move accepts them
+C_DLLEXPORT int PM_EntityMoveSupported()
+{
+	return 1;
+}
+
+#ifdef REGAMEDLL_API
+// Hookchain handlers expect a player, so they are skipped when moving a non-player entity
+#define LINK_HOOK_PM_VOID_CHAIN(functionName, args, ...)\
+	void functionName args {\
+		if (!PM_IsPlayerIndex(pmove->player_index)) {\
+			functionName##_OrigFunc(__VA_ARGS__);\
+			return;\
+		}\
+		g_ReGameHookchains.m_##functionName.callChain(functionName##_OrigFunc, __VA_ARGS__);\
+	}
+
+#define LINK_HOOK_PM_VOID_CHAIN2(functionName)\
+	void functionName() {\
+		if (!PM_IsPlayerIndex(pmove->player_index)) {\
+			functionName##_OrigFunc();\
+			return;\
+		}\
+		g_ReGameHookchains.m_##functionName.callChain(functionName##_OrigFunc);\
+	}
+#else
+#define LINK_HOOK_PM_VOID_CHAIN(...)
+#define LINK_HOOK_PM_VOID_CHAIN2(...)
+#endif
 
 #ifdef CLIENT_DLL
 	int iJumpSpectator;
@@ -365,7 +408,7 @@ void PM_CatagorizeTextureType()
 	pmove->chtexturetype = PM_FindTextureType(pmove->sztexturename);
 }
 
-LINK_HOOK_VOID_CHAIN2(PM_UpdateStepSound);
+LINK_HOOK_PM_VOID_CHAIN2(PM_UpdateStepSound);
 
 void EXT_FUNC __API_HOOK(PM_UpdateStepSound)()
 {
@@ -1274,7 +1317,7 @@ void PM_WaterMove()
 	PM_FlyMove();
 }
 
-LINK_HOOK_VOID_CHAIN(PM_AirMove, (int playerIndex = 0), pmove->player_index + 1);
+LINK_HOOK_PM_VOID_CHAIN(PM_AirMove, (int playerIndex = 0), pmove->player_index + 1);
 
 void EXT_FUNC __API_HOOK(PM_AirMove)(int playerIndex)
 {
@@ -1480,14 +1523,14 @@ void PM_CategorizePosition()
 int PM_GetRandomStuckOffsets(int nIndex, int server, vec_t *offset)
 {
 	// Last time we did a full
-	int idx = rgStuckLast[nIndex][server]++;
+	int idx = rgStuckLast[PM_StuckIndex(nIndex)][server]++;
 	VectorCopy(rgv3tStuckTable[idx % ARRAYSIZE(rgv3tStuckTable)], offset);
 	return (idx % ARRAYSIZE(rgv3tStuckTable));
 }
 
 void PM_ResetStuckOffsets(int nIndex, int server)
 {
-	rgStuckLast[nIndex][server] = 0;
+	rgStuckLast[PM_StuckIndex(nIndex)][server] = 0;
 }
 
 // If pmove->origin is in a solid position,
@@ -1505,7 +1548,7 @@ qboolean PM_CheckStuck()
 	pmtrace_t traceresult;
 
 	// Last time we did a full
-	static float rgStuckCheckTime[MAX_CLIENTS][2];
+	static float rgStuckCheckTime[MAX_EDICTS][2]; // per entity, see PM_StuckIndex
 
 	// If position is okay, exit
 	hitent = pmove->PM_TestPlayerPosition(pmove->origin, &traceresult);
@@ -1552,12 +1595,12 @@ qboolean PM_CheckStuck()
 	fTime = pmove->Sys_FloatTime();
 
 	// Too soon?
-	if (rgStuckCheckTime[pmove->player_index][idx] >= (fTime - PM_CHECKSTUCK_MINTIME))
+	if (rgStuckCheckTime[PM_StuckIndex(pmove->player_index)][idx] >= (fTime - PM_CHECKSTUCK_MINTIME))
 	{
 		return TRUE;
 	}
 
-	rgStuckCheckTime[pmove->player_index][idx] = fTime;
+	rgStuckCheckTime[PM_StuckIndex(pmove->player_index)][idx] = fTime;
 
 	pmove->PM_StuckTouch(hitent, &traceresult);
 
@@ -2419,7 +2462,9 @@ void PM_Jump()
 	}
 
 #ifdef REGAMEDLL_API
-	const CCSPlayer* player = UTIL_PlayerByIndex(pmove->player_index + 1)->CSPlayer();
+	// pmove->player_index isn't a player when the engine moves another entity (ReHLDS SV_RunEntityMove)
+	const CBasePlayer *pPlayer = PM_IsPlayerIndex(pmove->player_index) ? UTIL_PlayerByIndexSafe(pmove->player_index + 1) : nullptr;
+	const CCSPlayer *player = pPlayer ? pPlayer->CSPlayer() : nullptr;
 #endif
 
 	// don't pogo stick
@@ -2427,7 +2472,7 @@ void PM_Jump()
 #ifdef REGAMEDLL_ADD
 		&& sv_autobunnyhopping.value <= 0.0
 #ifdef REGAMEDLL_API
-		&& !player->m_bAutoBunnyHopping
+		&& !(player && player->m_bAutoBunnyHopping)
 #endif
 #endif
 		)
@@ -2448,7 +2493,7 @@ void PM_Jump()
 #ifdef REGAMEDLL_ADD
 	if (sv_enablebunnyhopping.value <= 0.0
 #ifdef REGAMEDLL_API
-		&& !player->m_bMegaBunnyJumping
+		&& !(player && player->m_bMegaBunnyJumping)
 #endif
 		)
 #endif
@@ -3207,7 +3252,19 @@ void PM_CreateStuckTable()
 	}
 }
 
-LINK_HOOK_VOID_CHAIN(PM_Move, (struct playermove_s *ppmove, int server), ppmove, server);
+#ifdef REGAMEDLL_API
+void PM_Move(struct playermove_s *ppmove, int server)
+{
+	// hookchain handlers expect a player, skip them for non-player entities
+	if (!PM_IsPlayerIndex(ppmove->player_index))
+	{
+		PM_Move_OrigFunc(ppmove, server);
+		return;
+	}
+
+	g_ReGameHookchains.m_PM_Move.callChain(PM_Move_OrigFunc, ppmove, server);
+}
+#endif
 
 // This module implements the shared player physics code between any particular game and
 // the engine. The same PM_Move routine is built into the game .dll and the client .dll and is
